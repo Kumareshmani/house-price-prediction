@@ -1,0 +1,368 @@
+# =============================================================================
+# python-app.yml
+# House Price Prediction — Full CI/CD Pipeline
+#
+# JOBS (run in order):
+#   1. lint         — code style & static analysis (flake8)
+#   2. test         — pytest suite with coverage (depends on lint)
+#   3. security     — dependency vulnerability scan (pip-audit)
+#   4. build-and-push — Docker image → GitHub Container Registry (main only)
+#   5. deploy-summary — prints pull command & image digest after publish
+#
+# TRIGGERS:
+#   • push        → main, master, develop
+#   • pull_request → main, master
+#   • workflow_dispatch → manual run from the GitHub Actions UI
+#
+# REQUIREMENTS (no manual secrets needed):
+#   • Settings → Actions → General → Workflow permissions
+#     → "Read and write permissions"   (needed to push to ghcr.io)
+#
+# DOCKER IMAGE:
+#   ghcr.io/<owner>/<repo>:latest
+#   ghcr.io/<owner>/<repo>:main          (branch)
+#   ghcr.io/<owner>/<repo>:sha-<short>   (commit, for rollbacks)
+# =============================================================================
+
+name: Python App CI/CD
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Triggers
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:           # allow manual trigger from GitHub UI
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Global environment variables (shared across all jobs)
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  PYTHON_VERSION: "3.12"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}   # e.g. my-org/house-price-prediction
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Concurrency — cancel in-progress runs on the same branch/PR
+# ─────────────────────────────────────────────────────────────────────────────
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# =============================================================================
+# JOB 1 — LINT
+# Runs flake8 to catch syntax errors and style violations early.
+# Fails fast so developers get instant feedback without waiting for tests.
+# =============================================================================
+jobs:
+  lint:
+    name: "Lint (flake8)"
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1.1 Checkout ──────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 1.2 Python ────────────────────────────────────────────────────────
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      # ── 1.3 Install lint tooling ──────────────────────────────────────────
+      - name: Install flake8
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8
+
+      # ── 1.4 Run flake8 ────────────────────────────────────────────────────
+      # E501  max line length 120
+      # W503  line break before binary operator (conflicts with Black)
+      - name: Run flake8
+        run: |
+          flake8 app.py train_model.py tests/ \
+            --max-line-length=120 \
+            --extend-ignore=W503 \
+            --statistics \
+            --count
+
+# =============================================================================
+# JOB 2 — TEST
+# Trains the model, then runs the full pytest suite (53 test cases) with
+# per-file coverage and exports both JUnit XML and Cobertura XML reports
+# as build artifacts.
+# =============================================================================
+  test:
+    name: "Test (pytest + coverage)"
+    runs-on: ubuntu-latest
+    needs: lint        # only run if lint passes
+
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]   # test on two Python versions
+
+    steps:
+      # ── 2.1 Checkout ──────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2.2 Python ────────────────────────────────────────────────────────
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      # ── 2.3 Install all dependencies (incl. pytest, pytest-cov) ──────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── 2.4 Train model ───────────────────────────────────────────────────
+      # app.py loads the model at import time; the model must exist before
+      # conftest.py imports the app.  train_model.py writes models/*.pkl.
+      - name: Train model
+        run: python train_model.py
+
+      # ── 2.5 Run test suite ────────────────────────────────────────────────
+      - name: Run pytest with coverage
+        run: |
+          pytest tests/ \
+            --cov=app \
+            --cov-branch \
+            --cov-report=term-missing \
+            --cov-report=xml:coverage-${{ matrix.python-version }}.xml \
+            --junitxml=test-results-${{ matrix.python-version }}.xml \
+            -v
+
+      # ── 2.6 Upload JUnit test results ─────────────────────────────────────
+      # Uploaded even when tests fail so failures are visible in the summary.
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-py${{ matrix.python-version }}
+          path: test-results-${{ matrix.python-version }}.xml
+          retention-days: 30
+
+      # ── 2.7 Upload coverage report ────────────────────────────────────────
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-py${{ matrix.python-version }}
+          path: coverage-${{ matrix.python-version }}.xml
+          retention-days: 30
+
+      # ── 2.8 Print coverage summary to job log ─────────────────────────────
+      - name: Coverage summary
+        run: |
+          echo "### Coverage Summary (Python ${{ matrix.python-version }})" >> $GITHUB_STEP_SUMMARY
+          pytest tests/ --cov=app --cov-report=term-missing --no-header -q 2>&1 \
+            | tail -20 >> $GITHUB_STEP_SUMMARY
+
+# =============================================================================
+# JOB 3 — SECURITY SCAN
+# Uses pip-audit to check all installed packages for known CVEs.
+# Runs in parallel with the test matrix (both depend on lint only).
+# =============================================================================
+  security:
+    name: "Security (pip-audit)"
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      # ── 3.1 Checkout ──────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 3.2 Python ────────────────────────────────────────────────────────
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      # ── 3.3 Install deps + pip-audit ──────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pip-audit
+
+      # ── 3.4 Audit installed packages ──────────────────────────────────────
+      - name: Run pip-audit
+        run: |
+          pip-audit \
+            --requirement requirements.txt \
+            --output-format columns
+
+      # ── 3.5 Write audit summary ───────────────────────────────────────────
+      - name: Audit summary
+        if: always()
+        run: |
+          echo "### pip-audit scan completed" >> $GITHUB_STEP_SUMMARY
+          echo "Scanned all packages in requirements.txt for known CVEs." >> $GITHUB_STEP_SUMMARY
+
+# =============================================================================
+# JOB 4 — BUILD AND PUSH DOCKER IMAGE
+# Builds the Docker image and pushes it to GitHub Container Registry (ghcr.io).
+# Only runs on push events to main/master (not on PRs) after tests pass.
+#
+# Tags produced:
+#   :latest          — default branch only
+#   :<branch-name>   — every branch push
+#   :sha-<short>     — every push (enables precise rollbacks)
+# =============================================================================
+  build-and-push:
+    name: "Build & Push Docker Image"
+    runs-on: ubuntu-latest
+    needs: [test, security]    # both must pass before building
+    if: >
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+
+    permissions:
+      contents: read
+      packages: write          # required to push to ghcr.io
+
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tags:   ${{ steps.meta.outputs.tags }}
+
+    steps:
+      # ── 4.1 Checkout ──────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 4.2 Set up QEMU (enables multi-platform builds if needed) ─────────
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # ── 4.3 Set up Docker Buildx ──────────────────────────────────────────
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── 4.4 Log in to GitHub Container Registry ───────────────────────────
+      # Uses the built-in GITHUB_TOKEN — no manual secret required.
+      # Ensure repo Settings → Actions → Workflow permissions → Read & write.
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 4.5 Generate Docker tags and OCI labels ───────────────────────────
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # :latest  — only when pushing to the default branch
+            type=raw,value=latest,enable={{is_default_branch}}
+            # :<branch>  — e.g. :main
+            type=ref,event=branch
+            # :sha-abc1234  — short commit SHA for traceability
+            type=sha,prefix=sha-,format=short
+          labels: |
+            org.opencontainers.image.title=House Price Prediction
+            org.opencontainers.image.description=Flask ML app predicting California house prices
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+
+      # ── 4.6 Build and push ────────────────────────────────────────────────
+      # Layer cache stored in GitHub Actions cache (gha) to speed up rebuilds.
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false      # set true to add SLSA provenance attestation
+
+      # ── 4.7 Write build summary ───────────────────────────────────────────
+      - name: Image build summary
+        run: |
+          echo "### Docker Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Digest:** \`${{ steps.build.outputs.digest }}\`" >> $GITHUB_STEP_SUMMARY
+
+# =============================================================================
+# JOB 5 — DEPLOY SUMMARY
+# Prints the exact docker pull / run commands for this release.
+# Runs after the image is published.  No actual deployment — extend this
+# job with your own deploy steps (Render, Fly.io, AWS ECS, etc.).
+# =============================================================================
+  deploy-summary:
+    name: "Deploy Summary"
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: >
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+
+    steps:
+      # ── 5.1 Print pull & run commands ─────────────────────────────────────
+      - name: Print deployment instructions
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ needs.build-and-push.outputs.image-digest }}
+        run: |
+          echo "============================================================"
+          echo "  Image published successfully!"
+          echo "============================================================"
+          echo ""
+          echo "Pull latest:"
+          echo "  docker pull ${IMAGE}:latest"
+          echo ""
+          echo "Pull by digest (immutable, safe for production):"
+          echo "  docker pull ${IMAGE}@${DIGEST}"
+          echo ""
+          echo "Run:"
+          echo "  docker run -d -p 5000:5000 --name house-price ${IMAGE}:latest"
+          echo ""
+          echo "Verify:"
+          echo "  curl http://localhost:5000/api/health"
+          echo "============================================================"
+
+      # ── 5.2 Write summary ─────────────────────────────────────────────────
+      - name: Deployment summary
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          DIGEST: ${{ needs.build-and-push.outputs.image-digest }}
+        run: |
+          echo "### Deployment Instructions" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "# Pull latest" >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ${IMAGE}:latest" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Pull by immutable digest (recommended for production)" >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ${IMAGE}@${DIGEST}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Run" >> $GITHUB_STEP_SUMMARY
+          echo "docker run -d -p 5000:5000 --name house-price ${IMAGE}:latest" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
